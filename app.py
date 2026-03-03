@@ -9,7 +9,6 @@ from openpyxl.utils import get_column_letter
 COL_START = 1   # A
 COL_END   = 11  # K
 COLS      = [get_column_letter(c) for c in range(COL_START, COL_END+1)]
-NUM_COLS  = len(COLS)
 MAX_CANDIDATES_PER_ROW = 500
 
 def normalize_value(v, trim_spaces=True, case_sensitive=True):
@@ -95,20 +94,20 @@ def read_sheet_data(file, sheet_name=None, trim_spaces=True, case_sensitive=True
         return rows, fills
     return rows
 
-def row_tuple(norm_row):
-    return tuple(norm_row[col] for col in COLS)
+def row_tuple(norm_row, cols):
+    return tuple(norm_row[col] for col in cols)
 
-def _count_eq(old_norm, new_norm):
-    return sum(1 for col in COLS if old_norm.get(col) == new_norm.get(col))
+def _count_eq(old_norm, new_norm, cols):
+    return sum(1 for col in cols if old_norm.get(col) == new_norm.get(col))
 
-def best_pairing(new_rows, old_rows, progress_bar=None):
-    """역인덱스 + row-by-row greedy 매칭. 거대 candidates 리스트를 만들지 않는다."""
+def best_pairing(new_rows, old_rows, cols, progress_bar=None):
+    """역인덱스 + row-by-row greedy 매칭."""
     if not new_rows or not old_rows:
         return [], list(range(len(old_rows))), list(range(len(new_rows)))
 
     col_val_to_old = defaultdict(set)
     for i, o in enumerate(old_rows):
-        for col in COLS:
+        for col in cols:
             v = o["norm"].get(col)
             if v is not None and v != "":
                 col_val_to_old[(col, v)].add(i)
@@ -120,20 +119,20 @@ def best_pairing(new_rows, old_rows, progress_bar=None):
             progress_bar.progress(j / total_new * 0.4,
                                   text=f"후보 탐색 중... ({j}/{total_new})")
         candidates = set()
-        for col in COLS:
+        for col in cols:
             v = n["norm"].get(col)
             if v is not None and v != "":
                 candidates.update(col_val_to_old.get((col, v), set()))
         if len(candidates) > MAX_CANDIDATES_PER_ROW:
             scored = []
             for i in candidates:
-                eq = _count_eq(old_rows[i]["norm"], n["norm"])
+                eq = _count_eq(old_rows[i]["norm"], n["norm"], cols)
                 scored.append((eq, i))
             scored.sort(reverse=True)
             candidates = set(i for _, i in scored[:MAX_CANDIDATES_PER_ROW])
         best_eq = 0
         for i in candidates:
-            eq = _count_eq(old_rows[i]["norm"], n["norm"])
+            eq = _count_eq(old_rows[i]["norm"], n["norm"], cols)
             best_eq = max(best_eq, eq)
         if candidates:
             new_info.append((best_eq, j, candidates))
@@ -151,7 +150,7 @@ def best_pairing(new_rows, old_rows, progress_bar=None):
         for i in candidates:
             if i in used_old:
                 continue
-            eq = _count_eq(old_rows[i]["norm"], n["norm"])
+            eq = _count_eq(old_rows[i]["norm"], n["norm"], cols)
             if eq > best_eq:
                 best_eq = eq
                 best_i = i
@@ -168,7 +167,7 @@ def best_pairing(new_rows, old_rows, progress_bar=None):
         fb = []
         for i in remaining_old:
             for j in remaining_new:
-                eq = _count_eq(old_rows[i]["norm"], new_rows[j]["norm"])
+                eq = _count_eq(old_rows[i]["norm"], new_rows[j]["norm"], cols)
                 if eq > 0:
                     fb.append((eq, i, j))
         fb.sort(reverse=True)
@@ -186,9 +185,10 @@ def best_pairing(new_rows, old_rows, progress_bar=None):
     leftover_new = [j for j in range(len(new_rows)) if j not in used_new]
     return pairs, leftover_old, leftover_new
 
-def build_diff_record(old_row, new_row):
+def build_diff_record(old_row, new_row, cols):
+    """비교 대상 열(cols)의 변경만 표시한다."""
     changes = []
-    for col in COLS:
+    for col in cols:
         ov = old_row["orig"].get(col)
         nv = new_row["orig"].get(col)
         if old_row["norm"].get(col) != new_row["norm"].get(col):
@@ -211,6 +211,14 @@ with st.expander("비교 옵션", expanded=True):
     trim_spaces = st.checkbox("앞뒤 공백 무시", value=True)
     case_sensitive = st.checkbox("대소문자 구분", value=True)
     exclude_rows_if_fill_changed = st.checkbox("색상(채우기) 변경된 행 제외", value=False)
+    exclude_cols = st.multiselect(
+        "비교에서 제외할 열 선택",
+        options=COLS,
+        default=[],
+        help="선택한 열은 동일 여부 판단에서 제외됩니다. 데이터는 그대로 읽지만 비교 시 무시합니다.")
+    compare_cols = [c for c in COLS if c not in exclude_cols]
+    if exclude_cols:
+        st.caption(f"비교 대상 열: **{', '.join(compare_cols)}** ({len(compare_cols)}개)")
 
 st.subheader("1) 기준(이전) 파일 저장")
 c1, c2 = st.columns(2)
@@ -236,14 +244,7 @@ if st.button("기준 데이터 저장", type="primary", disabled=not (file_old a
                 st.session_state["old_fills"] = old_fills
             else:
                 old_rows = read_sheet_values(file_old, sheet_old, trim_spaces, case_sensitive)
-
             st.session_state["old_rows"] = old_rows
-            st.session_state["old_rows_norm_multiset"] = Counter(
-                [row_tuple(r["norm"]) for r in old_rows])
-            mapping = defaultdict(list)
-            for idx, r in enumerate(old_rows):
-                mapping[row_tuple(r["norm"])].append(idx)
-            st.session_state["old_rows_by_tuple_indices"] = mapping
         st.success(f"기준 데이터 저장 완료: {len(old_rows)} 행")
     except Exception as e:
         st.exception(e)
@@ -267,8 +268,6 @@ if st.button("변경 사항 분석 실행", type="primary",
              disabled=not (file_new and sheet_new and ("old_rows" in st.session_state))):
     try:
         old_rows = st.session_state["old_rows"]
-        old_multiset = st.session_state["old_rows_norm_multiset"]
-        old_tuple_to_indices = st.session_state["old_rows_by_tuple_indices"]
 
         with st.spinner("비교 파일 읽는 중..."):
             if exclude_rows_if_fill_changed:
@@ -289,20 +288,28 @@ if st.button("변경 사항 분석 실행", type="primary",
                 new_rows = read_sheet_values(file_new, sheet_new, trim_spaces, case_sensitive)
                 fill_changed_rows = set()
 
-        st.info(f"기준 {len(old_rows)}행, 비교 {len(new_rows)}행 읽기 완료. 비교 시작...")
+        excluded_label = f" (제외 열: {', '.join(exclude_cols)})" if exclude_cols else ""
+        st.info(f"기준 {len(old_rows)}행, 비교 {len(new_rows)}행 읽기 완료. "
+                f"비교 대상 {len(compare_cols)}열{excluded_label}로 분석 시작...")
+
+        # 현재 compare_cols로 멀티셋 구축 (열 제외 옵션 즉시 반영)
+        old_multiset = Counter([row_tuple(r["norm"], compare_cols) for r in old_rows])
+        old_mapping = defaultdict(list)
+        for idx, r in enumerate(old_rows):
+            old_mapping[row_tuple(r["norm"], compare_cols)].append(idx)
 
         remaining_old_indices = set(range(len(old_rows)))
         remaining_new_indices = set(range(len(new_rows)))
         exact_pairs = []
         temp_multiset = old_multiset.copy()
-        temp_tuple_to_indices = {k: v.copy() for k, v in old_tuple_to_indices.items()}
+        temp_mapping = {k: v.copy() for k, v in old_mapping.items()}
 
         for j, nr in enumerate(new_rows):
             if nr["_row"] in fill_changed_rows:
                 continue
-            t = row_tuple(nr["norm"])
+            t = row_tuple(nr["norm"], compare_cols)
             if temp_multiset.get(t, 0) > 0:
-                i = temp_tuple_to_indices[t].pop(0)
+                i = temp_mapping[t].pop(0)
                 temp_multiset[t] -= 1
                 exact_pairs.append((i, j))
                 remaining_old_indices.discard(i)
@@ -315,7 +322,7 @@ if st.button("변경 사항 분석 실행", type="primary",
         if old_left and new_left:
             prog_bar = st.progress(0, text="부분 매칭 진행 중...")
             pairs, leftover_old_idx, leftover_new_idx = best_pairing(
-                new_left, old_left, progress_bar=prog_bar)
+                new_left, old_left, compare_cols, progress_bar=prog_bar)
             prog_bar.empty()
         else:
             pairs, leftover_old_idx, leftover_new_idx = [], [], []
@@ -337,7 +344,7 @@ if st.button("변경 사항 분석 실행", type="primary",
 
         changes_records = []
         for i, j, eq in best_pairs:
-            rec = build_diff_record(old_rows[i], new_rows[j])
+            rec = build_diff_record(old_rows[i], new_rows[j], compare_cols)
             rec["일치열수"] = eq
             rec["상태"] = "변경"
             changes_records.append(rec)
